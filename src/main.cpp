@@ -22,31 +22,26 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    cuda_filter::FilterType filterType =
-        cuda_filter::FilterUtils::stringToFilterType(options.filterType);
+    cv::Mat blurKernel = cuda_filter::FilterUtils::createFilterKernel(
+        cuda_filter::FilterType::BLUR, 3, 1.0f);
 
-    cv::Mat kernel = cuda_filter::FilterUtils::createFilterKernel(
-        filterType, options.kernelSize, options.intensity);
+    cv::Mat sharpenKernel = cuda_filter::FilterUtils::createFilterKernel(
+        cuda_filter::FilterType::SHARPEN, 3, 1.0f);
 
-    PLOG_INFO << "Filter: " << options.filterType
-              << ", Kernel size: " << options.kernelSize
-              << ", Intensity: " << options.intensity;
-
-    if (filterType == cuda_filter::FilterType::HDR_TONEMAPPING)
-    {
-        PLOG_INFO << "HDR tone mapping enabled";
-    }
-
-    cv::Mat frame, filteredCPU, filteredGPU;
-    double fpsCPU = 0.0, fpsGPU = 0.0;
-    int frameCountCPU = 0, frameCountGPU = 0;
-    double startTimeCPU = static_cast<double>(cv::getTickCount());
-    double startTimeGPU = static_cast<double>(cv::getTickCount());
-
-    float exposure = 1.5f;
-    float gamma = 2.2f;
-
+    PLOG_INFO << "Filter pipeline enabled: blur -> sharpen";
+    PLOG_INFO << "Wipe transition enabled";
     PLOG_INFO << "Press 'ESC' to exit";
+
+    cv::Mat frame;
+    cv::Mat stage1;
+    cv::Mat stage2;
+    cv::Mat transitionOutput;
+
+    double fps = 0.0;
+    int frameCount = 0;
+    double startTime = static_cast<double>(cv::getTickCount());
+
+    float transition = 0.0f;
 
     while (true)
     {
@@ -56,79 +51,65 @@ int main(int argc, char **argv)
             break;
         }
 
-        const double cpuStart = static_cast<double>(cv::getTickCount());
+        const double pipelineStart = static_cast<double>(cv::getTickCount());
 
-        if (filterType == cuda_filter::FilterType::HDR_TONEMAPPING)
-        {
-            frame.copyTo(filteredCPU);
-        }
-        else
-        {
-            cuda_filter::applyFilterCPU(frame, filteredCPU, kernel);
-        }
+        // Stage 1: blur
+        cuda_filter::applyFilterGPU(frame, stage1, blurKernel);
 
-        const double cpuEnd = static_cast<double>(cv::getTickCount());
-        const double cpuTime = (cpuEnd - cpuStart) / cv::getTickFrequency();
+        // Stage 2: sharpen
+        cuda_filter::applyFilterGPU(stage1, stage2, sharpenKernel);
 
-        frameCountCPU++;
-        if ((cpuEnd - startTimeCPU) / cv::getTickFrequency() >= 1.0)
-        {
-            fpsCPU = frameCountCPU;
-            frameCountCPU = 0;
-            startTimeCPU = cpuEnd;
-        }
+        const double pipelineEnd = static_cast<double>(cv::getTickCount());
+        const double pipelineTime =
+            (pipelineEnd - pipelineStart) / cv::getTickFrequency();
 
-        const double gpuStart = static_cast<double>(cv::getTickCount());
+        // Wipe transition from original frame to pipeline result
+        transitionOutput.create(frame.size(), frame.type());
 
-        if (filterType == cuda_filter::FilterType::HDR_TONEMAPPING)
+        int wipeX = static_cast<int>(frame.cols * transition);
+
+        for (int y = 0; y < frame.rows; y++)
         {
-            cuda_filter::applyHDRGPU(frame, filteredGPU, exposure, gamma);
-        }
-        else
-        {
-            cuda_filter::applyFilterGPU(frame, filteredGPU, kernel);
+            for (int x = 0; x < frame.cols; x++)
+            {
+                if (x < wipeX)
+                    transitionOutput.at<cv::Vec3b>(y, x) = stage2.at<cv::Vec3b>(y, x);
+                else
+                    transitionOutput.at<cv::Vec3b>(y, x) = frame.at<cv::Vec3b>(y, x);
+            }
         }
 
-        const double gpuEnd = static_cast<double>(cv::getTickCount());
-        const double gpuTime = (gpuEnd - gpuStart) / cv::getTickFrequency();
+        transition += 0.01f;
+        if (transition > 1.0f)
+            transition = 0.0f;
 
-        frameCountGPU++;
-        if ((gpuEnd - startTimeGPU) / cv::getTickFrequency() >= 1.0)
+        frameCount++;
+        double now = static_cast<double>(cv::getTickCount());
+        if ((now - startTime) / cv::getTickFrequency() >= 1.0)
         {
-            fpsGPU = frameCountGPU;
-            frameCountGPU = 0;
-            startTimeGPU = gpuEnd;
+            fps = frameCount;
+            frameCount = 0;
+            startTime = now;
         }
 
-        std::string cpuText = "CPU FPS: " + std::to_string(static_cast<int>(fpsCPU)) +
-                              " Time: " + std::to_string(cpuTime * 1000).substr(0, 4) + "ms";
+        std::string text = "Pipeline FPS: " + std::to_string(static_cast<int>(fps)) +
+                           " Time: " + std::to_string(pipelineTime * 1000).substr(0, 5) + "ms";
 
-        std::string gpuText = "GPU FPS: " + std::to_string(static_cast<int>(fpsGPU)) +
-                              " Time: " + std::to_string(gpuTime * 1000).substr(0, 4) + "ms";
+        cv::putText(transitionOutput, text, cv::Point(10, 30),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                    cv::Scalar(255, 255, 0), 2);
 
-        cv::putText(filteredCPU, cpuText, cv::Point(10, 30),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 0), 2);
+        cv::putText(transitionOutput, "Pipeline: blur -> sharpen",
+                    cv::Point(10, transitionOutput.rows - 40),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                    cv::Scalar(255, 255, 0), 2);
 
-        cv::putText(filteredGPU, gpuText, cv::Point(10, 30),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 0), 2);
+        cv::putText(transitionOutput, "Wipe transition",
+                    cv::Point(10, transitionOutput.rows - 10),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                    cv::Scalar(255, 255, 0), 2);
 
-        cv::Mat combined;
-        cv::hconcat(filteredCPU, filteredGPU, combined);
-
-        cv::putText(combined, "Original / CPU", cv::Point(10, combined.rows - 10),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 0), 2);
-
-        cv::putText(combined, "GPU HDR / Filter", cv::Point(combined.cols / 2 + 10, combined.rows - 10),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 0), 2);
-
-        if (options.preview)
-        {
-            inputHandler.displaySideBySide(frame, combined);
-        }
-        else
-        {
-            inputHandler.displayFrame(combined);
-        }
+        inputHandler.displayFrame(transitionOutput);
 
         if (cv::waitKey(1) == 27)
         {
