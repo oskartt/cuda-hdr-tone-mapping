@@ -9,12 +9,15 @@
 
 int main(int argc, char **argv)
 {
+    // Initialize logger
     plog::ConsoleAppender<plog::TxtFormatter> consoleAppender;
     plog::init(plog::info, &consoleAppender);
 
+    // Read command-line options such as filter type and kernel size
     cuda_filter::InputArgsParser parser(argc, argv);
     cuda_filter::FilterOptions options = parser.parseArgs();
 
+    // Open webcam or input source
     cuda_filter::InputHandler inputHandler(options);
     if (!inputHandler.isOpened())
     {
@@ -22,99 +25,130 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    cv::Mat blurKernel = cuda_filter::FilterUtils::createFilterKernel(
-        cuda_filter::FilterType::BLUR, 3, 1.0f);
+    // Convert filter name, for example "hdr", into FilterType enum
+    cuda_filter::FilterType filterType =
+        cuda_filter::FilterUtils::stringToFilterType(options.filterType);
 
-    cv::Mat sharpenKernel = cuda_filter::FilterUtils::createFilterKernel(
-        cuda_filter::FilterType::SHARPEN, 3, 1.0f);
+    // Create normal convolution kernel for standard filters.
+    // HDR uses a separate CUDA kernel, so this is only a placeholder for HDR.
+    cv::Mat kernel = cuda_filter::FilterUtils::createFilterKernel(
+        filterType, options.kernelSize, options.intensity);
 
-    PLOG_INFO << "Filter pipeline enabled: blur -> sharpen";
-    PLOG_INFO << "Wipe transition enabled";
+    // HDR parameters used by the CUDA tone mapping kernel
+    float exposure = 1.5f;
+    float gamma = 2.2f;
+
+    PLOG_INFO << "Filter: " << options.filterType;
+
+    if (filterType == cuda_filter::FilterType::HDR_TONEMAPPING)
+    {
+        PLOG_INFO << "HDR tone mapping enabled";
+        PLOG_INFO << "Exposure: " << exposure << ", Gamma: " << gamma;
+    }
+
+    cv::Mat frame, filteredCPU, filteredGPU;
+
+    double fpsCPU = 0.0, fpsGPU = 0.0;
+    int frameCountCPU = 0, frameCountGPU = 0;
+
+    double startTimeCPU = static_cast<double>(cv::getTickCount());
+    double startTimeGPU = static_cast<double>(cv::getTickCount());
+
     PLOG_INFO << "Press 'ESC' to exit";
-
-    cv::Mat frame;
-    cv::Mat stage1;
-    cv::Mat stage2;
-    cv::Mat transitionOutput;
-
-    double fps = 0.0;
-    int frameCount = 0;
-    double startTime = static_cast<double>(cv::getTickCount());
-
-    float transition = 0.0f;
 
     while (true)
     {
+        // Capture a frame from webcam or input source
         if (!inputHandler.readFrame(frame))
         {
             PLOG_ERROR << "Failed to read frame";
             break;
         }
 
-        const double pipelineStart = static_cast<double>(cv::getTickCount());
+        // CPU side is used for comparison.
+        // For HDR, the CPU side shows the original image.
+        const double cpuStart = static_cast<double>(cv::getTickCount());
 
-        // Stage 1: blur
-        cuda_filter::applyFilterGPU(frame, stage1, blurKernel);
-
-        // Stage 2: sharpen
-        cuda_filter::applyFilterGPU(stage1, stage2, sharpenKernel);
-
-        const double pipelineEnd = static_cast<double>(cv::getTickCount());
-        const double pipelineTime =
-            (pipelineEnd - pipelineStart) / cv::getTickFrequency();
-
-        // Wipe transition from original frame to pipeline result
-        transitionOutput.create(frame.size(), frame.type());
-
-        int wipeX = static_cast<int>(frame.cols * transition);
-
-        for (int y = 0; y < frame.rows; y++)
+        if (filterType == cuda_filter::FilterType::HDR_TONEMAPPING)
         {
-            for (int x = 0; x < frame.cols; x++)
-            {
-                if (x < wipeX)
-                    transitionOutput.at<cv::Vec3b>(y, x) = stage2.at<cv::Vec3b>(y, x);
-                else
-                    transitionOutput.at<cv::Vec3b>(y, x) = frame.at<cv::Vec3b>(y, x);
-            }
+            frame.copyTo(filteredCPU);
+        }
+        else
+        {
+            cuda_filter::applyFilterCPU(frame, filteredCPU, kernel);
         }
 
-        transition += 0.01f;
-        if (transition > 1.0f)
-            transition = 0.0f;
+        const double cpuEnd = static_cast<double>(cv::getTickCount());
+        const double cpuTime = (cpuEnd - cpuStart) / cv::getTickFrequency();
 
-        frameCount++;
-        double now = static_cast<double>(cv::getTickCount());
-        if ((now - startTime) / cv::getTickFrequency() >= 1.0)
+        frameCountCPU++;
+        if ((cpuEnd - startTimeCPU) / cv::getTickFrequency() >= 1.0)
         {
-            fps = frameCount;
-            frameCount = 0;
-            startTime = now;
+            fpsCPU = frameCountCPU;
+            frameCountCPU = 0;
+            startTimeCPU = cpuEnd;
         }
 
-        std::string text = "Pipeline FPS: " + std::to_string(static_cast<int>(fps)) +
-                           " Time: " + std::to_string(pipelineTime * 1000).substr(0, 5) + "ms";
+        // GPU processing section.
+        // If HDR is selected, run the CUDA HDR tone mapping kernel.
+        const double gpuStart = static_cast<double>(cv::getTickCount());
 
-        cv::putText(transitionOutput, text, cv::Point(10, 30),
+        if (filterType == cuda_filter::FilterType::HDR_TONEMAPPING)
+        {
+            cuda_filter::applyHDRGPU(frame, filteredGPU, exposure, gamma);
+        }
+        else
+        {
+            cuda_filter::applyFilterGPU(frame, filteredGPU, kernel);
+        }
+
+        const double gpuEnd = static_cast<double>(cv::getTickCount());
+        const double gpuTime = (gpuEnd - gpuStart) / cv::getTickFrequency();
+
+        frameCountGPU++;
+        if ((gpuEnd - startTimeGPU) / cv::getTickFrequency() >= 1.0)
+        {
+            fpsGPU = frameCountGPU;
+            frameCountGPU = 0;
+            startTimeGPU = gpuEnd;
+        }
+
+        // Text overlay showing CPU and GPU timing
+        std::string cpuText = "CPU FPS: " + std::to_string(static_cast<int>(fpsCPU)) +
+                              " Time: " + std::to_string(cpuTime * 1000).substr(0, 4) + "ms";
+
+        std::string gpuText = "GPU FPS: " + std::to_string(static_cast<int>(fpsGPU)) +
+                              " Time: " + std::to_string(gpuTime * 1000).substr(0, 4) + "ms";
+
+        cv::putText(filteredCPU, cpuText, cv::Point(10, 30),
                     cv::FONT_HERSHEY_SIMPLEX, 0.7,
                     cv::Scalar(255, 255, 0), 2);
 
-        cv::putText(transitionOutput, "Pipeline: blur -> sharpen",
-                    cv::Point(10, transitionOutput.rows - 40),
+        cv::putText(filteredGPU, gpuText, cv::Point(10, 30),
                     cv::FONT_HERSHEY_SIMPLEX, 0.7,
                     cv::Scalar(255, 255, 0), 2);
 
-        cv::putText(transitionOutput, "Wipe transition",
-                    cv::Point(10, transitionOutput.rows - 10),
+        // Combine original/CPU and GPU HDR output side by side
+        cv::Mat combined;
+        cv::hconcat(filteredCPU, filteredGPU, combined);
+
+        cv::putText(combined, "Original / CPU", cv::Point(10, combined.rows - 10),
                     cv::FONT_HERSHEY_SIMPLEX, 0.7,
                     cv::Scalar(255, 255, 0), 2);
 
-        inputHandler.displayFrame(transitionOutput);
+        cv::putText(combined, "GPU HDR / Filter", cv::Point(combined.cols / 2 + 10, combined.rows - 10),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                    cv::Scalar(255, 255, 0), 2);
 
+        // Display the final comparison frame
+        if (options.preview)
+            inputHandler.displaySideBySide(frame, combined);
+        else
+            inputHandler.displayFrame(combined);
+
+        // ESC exits the program
         if (cv::waitKey(1) == 27)
-        {
             break;
-        }
     }
 
     PLOG_INFO << "Application terminated";
